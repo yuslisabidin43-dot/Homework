@@ -21,10 +21,11 @@ There is no test suite. To exercise the backend, run it against a throwaway DB (
 
 ## Architecture
 
-**The business logic exists twice and must be kept in sync.** `index.html` runs in two modes chosen by `LOCAL = location.protocol === 'file:'`:
+**The business logic exists twice and must be kept in sync.** `index.html` has three runtime modes, chosen at boot (`detectServer()`, `LOCAL`, `BASE`):
 
-- http(s): `api()` calls `fetch` against `server.py` (shared SQLite DB).
-- file://: `api()` routes to `localApi()`, a JS reimplementation of the server's routes backed by `localStorage` (`itdesk_v1`); the signed-in user lives in `sessionStorage` so each tab can be a different person.
+- Served by `server.py` over http: `api()` calls `fetch` on the same origin (cookie session, shared SQLite DB).
+- Opened from disk (file://) with the server running: `detectServer()` probes `http://localhost:8000/api/meta`; if it answers, `api()` calls that server cross-origin with an `Authorization: Bearer` token (kept in `sessionStorage`, returned by `/api/login` and `/api/register`) because cookies are not sent from file://. The server enables CORS only for `ALLOWED_ORIGINS` (`"null"` = file://, plus localhost:8000). A header badge shows which mode is active.
+- Opened from disk with no server: `api()` routes to `localApi()`, a JS reimplementation of the server's routes backed by `localStorage` (`itdesk_v1`); the signed-in user lives in `sessionStorage` so each tab can be a different person. Data here is not shared with the server.
 
 Any change to SLA hours, categories, priorities, status transitions, validation, registration rules or the queue ordering has to be made in both `server.py` (constants at the top, route handlers in `Handler`) and `index.html` (the `L` constants object and `localApi`). The UI code itself (render/draw functions) is shared and only talks to `api()`.
 

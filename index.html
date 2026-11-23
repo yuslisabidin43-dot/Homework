@@ -43,7 +43,7 @@
 </style>
 </head>
 <body>
-<header><h1>IT Service Desk</h1><span class="who" id="who"></span><button id="logout" hidden>Sign out</button></header>
+<header><h1>IT Service Desk</h1><span id="mode" style="font-size:12px"></span><span class="who" id="who"></span><button id="logout" hidden>Sign out</button></header>
 <main id="app"></main>
 <aside id="detail"></aside>
 <script>
@@ -52,13 +52,27 @@ let ME = null, META = null, TICKETS = [], timer = null;
 
 // ---- Two modes -------------------------------------------------------------
 // http(s)://  -> talks to server.py (shared database for everyone)
-// file://     -> standalone: all logic runs here in JavaScript, data in this browser's localStorage
-const LOCAL = location.protocol === 'file:';
+// file://     -> uses server.py at SERVER if it is running (same shared database, bearer-token sign-in);
+//                otherwise standalone: all logic runs here in JavaScript, data in this browser's localStorage
+const SERVER = 'http://localhost:8000';
+let LOCAL = location.protocol === 'file:'; // true = offline/local-only mode (decided in detectServer)
+let BASE = '';                              // '' = same origin; SERVER when opened from disk
+async function detectServer() {
+  if (location.protocol !== 'file:') return;
+  try {
+    const r = await fetch(SERVER + '/api/meta', {signal: AbortSignal.timeout(1500)});
+    if (r.ok) { LOCAL = false; BASE = SERVER; }
+  } catch (e) { /* server not running: stay in local mode */ }
+}
 async function api(path, opts = {}) {
   if (LOCAL) return localApi(path, opts);
-  const r = await fetch(path, {credentials: 'same-origin', headers: {'Content-Type': 'application/json'}, ...opts});
+  const headers = {'Content-Type': 'application/json'}, tok = sessionStorage.getItem('itdesk_token');
+  if (tok) headers.Authorization = 'Bearer ' + tok; // used from file://, where cookies are not sent
+  const r = await fetch(BASE + path, {credentials: 'same-origin', headers, ...opts});
   const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.error || r.statusText);
+  if (j.token) sessionStorage.setItem('itdesk_token', j.token);
+  if (path === '/api/logout') sessionStorage.removeItem('itdesk_token');
   return j;
 }
 
@@ -168,7 +182,14 @@ async function localApi(path, opts) {
   fail('Not found');
 }
 function exportCsv() {
-  if (!LOCAL) { location.href = '/api/audit.csv'; return; }
+  if (!LOCAL) { // fetch with the bearer token so it also works from file://
+    const tok = sessionStorage.getItem('itdesk_token');
+    fetch(BASE + '/api/audit.csv', {credentials: 'same-origin', headers: tok ? {Authorization: 'Bearer ' + tok} : {}})
+      .then(r => r.ok ? r.blob() : Promise.reject(new Error('Export failed')))
+      .then(b => { const a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'ticket_audit_log.csv'; a.click(); })
+      .catch(e => alert(e.message));
+    return;
+  }
   api('/api/audit.csv').then(({events}) => {
     const q = v => { v = String(v ?? ''); if (/^[=+\-@]/.test(v)) v = "'" + v; return '"' + v.replace(/"/g, '""') + '"'; };
     const rows = [['event_id', 'ticket_id', 'event_type', 'from_status', 'to_status', 'actor', 'actor_role', 'timestamp_utc', 'note']]
@@ -193,6 +214,11 @@ function dur(s) {
 }
 
 async function boot() {
+  await detectServer();
+  if (location.protocol === 'file:') {
+    $('#mode').textContent = LOCAL ? '● Offline: data saved in this browser only (start server.py to share)' : '● Connected to ' + SERVER;
+    $('#mode').style.color = LOCAL ? '#b26a00' : '#1f8a4c';
+  }
   META = await api('/api/meta');
   ME = (await api('/api/me')).user;
   render();

@@ -35,6 +35,7 @@ TRANSITIONS = {
     "Closed": [],
 }
 MAX_DESC = 5000
+ALLOWED_ORIGINS = {"null", "http://localhost:8000", "http://127.0.0.1:8000"}  # "null" = file://
 
 SEED_USERS = [  # demo identities - replace with SSO/AD in production
     ("Alice Tan", "alice@company.com", "requester"),
@@ -161,6 +162,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        # CORS so index.html opened from disk (Origin: null) can use this server.
+        # Only an allow-list is echoed back; sign-in there is by bearer token, not cookie.
+        origin = self.headers.get("Origin")
+        if origin in ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Vary", "Origin")
         for k, v in (extra or []):
             self.send_header(k, v)
         self.end_headers()
@@ -183,20 +192,32 @@ class Handler(BaseHTTPRequestHandler):
             raise HttpError(400, "Expected a JSON object")
         return v
 
-    def _user(self, conn):
+    def _token(self):
+        """Session token from 'Authorization: Bearer' (file:// page) or the 'sid' cookie."""
+        auth = self.headers.get("Authorization") or ""
+        if auth.startswith("Bearer "):
+            return auth[7:].strip()
         raw = self.headers.get("Cookie")
-        if not raw:
-            return None
-        c = cookies.SimpleCookie()
-        try:
-            c.load(raw)
-        except cookies.CookieError:
-            return None
-        if "sid" not in c:
+        if raw:
+            c = cookies.SimpleCookie()
+            try:
+                c.load(raw)
+            except cookies.CookieError:
+                return None
+            if "sid" in c:
+                return c["sid"].value
+        return None
+
+    def _user(self, conn):
+        tok = self._token()
+        if not tok:
             return None
         return conn.execute(
             "SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=?",
-            (c["sid"].value,)).fetchone()
+            (tok,)).fetchone()
+
+    def do_OPTIONS(self):  # CORS preflight
+        self._send(204, b"", "text/plain")
 
     def _require(self, conn, role=None):
         u = self._user(conn)
@@ -255,7 +276,7 @@ class Handler(BaseHTTPRequestHandler):
             tok = secrets.token_urlsafe(32)
             conn.execute("INSERT INTO sessions VALUES(?,?,?)", (tok, u["id"], iso(now())))
             ck = "sid=%s; HttpOnly; SameSite=Lax; Path=/" % tok
-            return self._json({"user": dict(u)}, extra=[("Set-Cookie", ck)])
+            return self._json({"user": dict(u), "token": tok}, extra=[("Set-Cookie", ck)])
         if method == "POST" and path == "/api/register":
             # Self-registration always creates an employee (requester), never an agent.
             name = " ".join(str(self._body().get("name") or "").split())
@@ -273,13 +294,11 @@ class Handler(BaseHTTPRequestHandler):
             tok = secrets.token_urlsafe(32)
             conn.execute("INSERT INTO sessions VALUES(?,?,?)", (tok, u["id"], iso(now())))
             ck = "sid=%s; HttpOnly; SameSite=Lax; Path=/" % tok
-            return self._json({"user": dict(u)}, 201, extra=[("Set-Cookie", ck)])
+            return self._json({"user": dict(u), "token": tok}, 201, extra=[("Set-Cookie", ck)])
         if method == "POST" and path == "/api/logout":
-            raw = self.headers.get("Cookie") or ""
-            for part in raw.split(";"):
-                k, _, v = part.strip().partition("=")
-                if k == "sid":
-                    conn.execute("DELETE FROM sessions WHERE token=?", (v,))
+            tok = self._token()
+            if tok:
+                conn.execute("DELETE FROM sessions WHERE token=?", (tok,))
             return self._json({"ok": True}, extra=[
                 ("Set-Cookie", "sid=; Max-Age=0; HttpOnly; SameSite=Lax; Path=/")])
 
