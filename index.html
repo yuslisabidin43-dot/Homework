@@ -1,0 +1,311 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IT Service Desk</title>
+<style>
+  :root{--bg:#f5f6f8;--card:#fff;--ink:#1c2230;--mute:#6b7385;--line:#e2e5eb;--brand:#2956d6;
+    --ok:#1f8a4c;--ok-bg:#e8f6ee;--risk:#b26a00;--risk-bg:#fff4dc;--bad:#c0262d;--bad-bg:#fdeaea}
+  *{box-sizing:border-box} body{margin:0;font:14px/1.45 system-ui,sans-serif;background:var(--bg);color:var(--ink)}
+  header{background:var(--card);border-bottom:1px solid var(--line);padding:12px 24px;display:flex;align-items:center;gap:16px}
+  header h1{font-size:17px;margin:0;flex:1} .who{color:var(--mute)}
+  main{max-width:1100px;margin:24px auto;padding:0 16px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px;margin-bottom:20px}
+  h2{font-size:15px;margin:0 0 12px}
+  label{display:block;font-weight:600;margin:10px 0 4px} select,textarea,button{font:inherit}
+  select,textarea{width:100%;padding:8px;border:1px solid var(--line);border-radius:6px;background:#fff}
+  textarea{min-height:90px;resize:vertical}
+  button{padding:8px 14px;border-radius:6px;border:1px solid var(--line);background:#fff;cursor:pointer}
+  button.primary{background:var(--brand);border-color:var(--brand);color:#fff} button:disabled{opacity:.5;cursor:default}
+  .row{display:flex;gap:12px;flex-wrap:wrap} .row>div{flex:1;min-width:200px}
+  table{width:100%;border-collapse:collapse} th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--mute)}
+  tbody tr{cursor:pointer} tbody tr:hover{background:#fafbfd}
+  tr.s-breached{background:var(--bad-bg);box-shadow:inset 4px 0 var(--bad)}
+  tr.s-at_risk{background:var(--risk-bg);box-shadow:inset 4px 0 #e0a100}
+  tr.s-ok{box-shadow:inset 4px 0 #cfe9da}
+  tr.s-breached:hover{background:#fbdede} tr.s-at_risk:hover{background:#ffedc2}
+  .pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:12px;font-weight:600;border:1px solid var(--line);background:#fff}
+  .sla{font-variant-numeric:tabular-nums;font-weight:600}
+  .sla.ok{color:var(--ok)} .sla.at_risk{color:var(--risk)} .sla.breached,.sla.breached_closed{color:var(--bad)} .sla.met{color:var(--ok)}
+  .P1{background:var(--bad);color:#fff;border-color:var(--bad)} .P2{background:#f08a24;color:#fff;border-color:#f08a24}
+  .legend{display:flex;gap:16px;color:var(--mute);margin-bottom:10px;font-size:12px;align-items:center}
+  .dot{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px}
+  .desc{max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--mute)}
+  .toolbar{display:flex;gap:10px;align-items:center;margin-bottom:10px} .toolbar .sp{flex:1}
+  #detail{position:fixed;top:0;right:0;bottom:0;width:min(480px,100%);background:var(--card);border-left:1px solid var(--line);
+    box-shadow:-8px 0 24px #0002;padding:20px;overflow:auto;display:none;z-index:5}
+  .timeline{list-style:none;padding:0;margin:8px 0 0;border-left:2px solid var(--line)}
+  .timeline li{padding:0 0 14px 14px;position:relative} .timeline li:before{content:"";position:absolute;left:-6px;top:5px;width:10px;height:10px;border-radius:50%;background:var(--brand)}
+  .mute{color:var(--mute)} .err{color:var(--bad);margin-top:8px} .full{white-space:pre-wrap;margin:8px 0}
+  .actions{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0} .empty{padding:24px;text-align:center;color:var(--mute)}
+</style>
+</head>
+<body>
+<header><h1>IT Service Desk</h1><span class="who" id="who"></span><button id="logout" hidden>Sign out</button></header>
+<main id="app"></main>
+<aside id="detail"></aside>
+<script>
+const $ = s => document.querySelector(s);
+let ME = null, META = null, TICKETS = [], timer = null;
+
+// ---- Two modes -------------------------------------------------------------
+// http(s)://  -> talks to server.py (shared database for everyone)
+// file://     -> standalone: all logic runs here in JavaScript, data in this browser's localStorage
+const LOCAL = location.protocol === 'file:';
+async function api(path, opts = {}) {
+  if (LOCAL) return localApi(path, opts);
+  const r = await fetch(path, {credentials: 'same-origin', headers: {'Content-Type': 'application/json'}, ...opts});
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+
+const L = {
+  SLA_HOURS: {P1: 4, P2: 8, P3: 24, P4: 72},
+  LABELS: {P1: 'Critical', P2: 'High', P3: 'Medium', P4: 'Low'},
+  CATS: ['Hardware', 'Software', 'Network / VPN', 'Email & Calendar', 'Account & Access', 'Security', 'Printing', 'Other'],
+  STATUSES: ['Open', 'In Progress', 'Resolved', 'Closed'],
+  TRANS: {'Open': ['In Progress'], 'In Progress': ['Resolved'], 'Resolved': ['Closed', 'In Progress'], 'Closed': []},
+  AT_RISK: 0.25,
+};
+const nowIso = () => new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+function ldb() {
+  let d = null;
+  try { d = JSON.parse(localStorage.getItem('itdesk_v1')); } catch (e) {}
+  if (!d) d = {users: [
+      {id: 1, name: 'Alice Tan', email: 'alice@company.com', role: 'requester'},
+      {id: 2, name: 'Bob Lim', email: 'bob@company.com', role: 'requester'},
+      {id: 3, name: 'Chitra Nair', email: 'chitra@company.com', role: 'requester'},
+      {id: 4, name: 'Dev Patel', email: 'dev.patel@company.com', role: 'agent'},
+      {id: 5, name: 'Erin Walsh', email: 'erin.walsh@company.com', role: 'agent'}],
+    tickets: [], events: [], nextTicket: 1, nextUser: 6, nextEvent: 1};
+  return d;
+}
+const lsave = d => localStorage.setItem('itdesk_v1', JSON.stringify(d));
+function lsla(t) {
+  const due = Date.parse(t.sla_due_at), total = t.sla_hours * 3600;
+  if (t.status === 'Resolved' || t.status === 'Closed') {
+    const stop = t.resolved_at ? Date.parse(t.resolved_at) : Date.now();
+    return {state: stop <= due ? 'met' : 'breached_closed', remaining_seconds: Math.round((due - stop) / 1000)};
+  }
+  const rem = Math.round((due - Date.now()) / 1000);
+  return {state: rem <= 0 ? 'breached' : rem <= total * L.AT_RISK ? 'at_risk' : 'ok', remaining_seconds: rem};
+}
+function ldict(d, t) {
+  const name = id => (d.users.find(u => u.id === id) || {}).name || null;
+  return {...t, requester_name: name(t.requester_id), assignee_name: name(t.assignee_id),
+          priority_label: L.LABELS[t.priority], sla: lsla(t)};
+}
+async function localApi(path, opts) {
+  const method = opts.method || 'GET', b = opts.body ? JSON.parse(opts.body) : {};
+  const [p, q] = path.split('?'), qs = new URLSearchParams(q || ''), d = ldb();
+  const meId = +sessionStorage.getItem('itdesk_me'); // per-tab, so two tabs can be two people
+  const me = d.users.find(u => u.id === meId) || null;
+  const fail = m => { throw new Error(m); };
+  const login = u => { sessionStorage.setItem('itdesk_me', u.id); return {user: u}; };
+  const mustLogin = () => me || fail('Not signed in');
+
+  if (p === '/api/meta') return {categories: L.CATS, statuses: L.STATUSES, transitions: L.TRANS,
+    priorities: Object.keys(L.SLA_HOURS).map(c => ({code: c, label: L.LABELS[c], sla_hours: L.SLA_HOURS[c]})), at_risk_fraction: L.AT_RISK};
+  if (p === '/api/users') return [...d.users].sort((a, b) => a.role.localeCompare(b.role) || a.name.localeCompare(b.name));
+  if (p === '/api/me') return {user: me};
+  if (p === '/api/login') { const u = d.users.find(u => u.id === b.user_id); return u ? login(u) : fail('Unknown user'); }
+  if (p === '/api/logout') { sessionStorage.removeItem('itdesk_me'); return {ok: true}; }
+  if (p === '/api/register') {
+    const name = String(b.name || '').trim().replace(/\s+/g, ' ');
+    if (name.length < 2 || name.length > 60) fail('Name must be 2-60 characters');
+    if (d.users.some(u => u.name.toLowerCase() === name.toLowerCase())) fail('That name is already registered - pick it from the list');
+    const slug = name.toLowerCase().replace(/ /g, '.').replace(/[^a-z0-9.]/g, '') || 'user';
+    let email = slug + '@company.com', n = 1;
+    while (d.users.some(u => u.email === email)) email = slug + (++n) + '@company.com';
+    const u = {id: d.nextUser++, name, email, role: 'requester'}; // never an agent
+    d.users.push(u); lsave(d); return login(u);
+  }
+  const audit = (t, type, from, to, actor, note) => d.events.push({id: d.nextEvent++, ticket_id: t.id, event_type: type,
+    from_status: from, to_status: to, actor_id: actor.id, actor_name: actor.name, actor_role: actor.role, at: nowIso(), note: note || null});
+
+  if (p === '/api/audit.csv') { mustLogin().role === 'agent' || fail('Support agents only'); return {events: d.events}; }
+  if (p === '/api/tickets' && method === 'POST') {
+    const u = mustLogin(), desc = String(b.description || '').trim();
+    if (!L.CATS.includes(b.category)) fail('Invalid category');
+    if (!(b.priority in L.SLA_HOURS)) fail('Invalid priority');
+    if (!desc) fail('Description is required');
+    if (desc.length > 5000) fail('Description too long (max 5000)');
+    const created = nowIso(), hours = L.SLA_HOURS[b.priority];
+    const due = new Date(Date.parse(created) + hours * 3600e3).toISOString().replace(/\.\d+Z$/, 'Z');
+    const t = {id: d.nextTicket++, category: b.category, description: desc, priority: b.priority, status: 'Open',
+      requester_id: u.id, assignee_id: null, sla_hours: hours, created_at: created, sla_due_at: due, resolved_at: null, closed_at: null};
+    d.tickets.push(t); audit(t, 'created', null, 'Open', u, `Ticket raised; SLA ${hours}h (due ${due})`); lsave(d);
+    return ldict(d, t);
+  }
+  if (p === '/api/tickets') {
+    const u = mustLogin();
+    let ts = d.tickets.filter(t => u.role === 'agent' || t.requester_id === u.id);
+    if ((qs.get('view') || 'active') === 'active') ts = ts.filter(t => t.status === 'Open' || t.status === 'In Progress');
+    const out = ts.map(t => ldict(d, t)), act = x => x.status === 'Open' || x.status === 'In Progress';
+    return [...out.filter(act).sort((a, b) => a.sla.remaining_seconds - b.sla.remaining_seconds),
+            ...out.filter(x => !act(x)).sort((a, b) => b.created_at.localeCompare(a.created_at))];
+  }
+  let m = p.match(/^\/api\/tickets\/(\d+)(\/status)?$/);
+  if (m) {
+    const u = mustLogin(), t = d.tickets.find(t => t.id === +m[1]);
+    if (!t || (u.role === 'requester' && t.requester_id !== u.id)) fail('Ticket not found');
+    if (m[2] && method === 'POST') {
+      u.role === 'agent' || fail('Support agents only');
+      if (!L.STATUSES.includes(b.status)) fail('Invalid status');
+      if (!L.TRANS[t.status].includes(b.status)) fail(`Cannot move ${t.status} -> ${b.status}`);
+      const ts = nowIso(), from = t.status;
+      t.status = b.status;
+      if (b.status === 'In Progress') { t.assignee_id = u.id; t.resolved_at = null; }
+      if (b.status === 'Resolved') t.resolved_at = ts;
+      if (b.status === 'Closed') t.closed_at = ts;
+      audit(t, 'status_change', from, b.status, u, String(b.note || '').trim().slice(0, 500)); lsave(d);
+    }
+    return {...ldict(d, t), events: d.events.filter(e => e.ticket_id === t.id)};
+  }
+  fail('Not found');
+}
+function exportCsv() {
+  if (!LOCAL) { location.href = '/api/audit.csv'; return; }
+  api('/api/audit.csv').then(({events}) => {
+    const q = v => { v = String(v ?? ''); if (/^[=+\-@]/.test(v)) v = "'" + v; return '"' + v.replace(/"/g, '""') + '"'; };
+    const rows = [['event_id', 'ticket_id', 'event_type', 'from_status', 'to_status', 'actor', 'actor_role', 'timestamp_utc', 'note']]
+      .concat(events.map(e => [e.id, e.ticket_id, e.event_type, e.from_status, e.to_status, e.actor_name, e.actor_role, e.at, e.note]));
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([rows.map(r => r.map(q).join(',')).join('\n')], {type: 'text/csv'}));
+    a.download = 'ticket_audit_log.csv'; a.click();
+  }).catch(e => alert(e.message));
+}
+addEventListener('storage', () => { if (ME && $('#list')) load().catch(() => {}); }); // other tab changed data
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmtTime = iso => iso ? new Date(iso).toLocaleString() : '';
+function fmtRemaining(sec, state) {
+  if (state === 'met') return 'Met SLA';
+  if (state === 'breached_closed') return 'Breached by ' + dur(-sec);
+  const s = Math.abs(sec), txt = dur(s);
+  return sec < 0 ? txt + ' overdue' : txt + ' left';
+}
+function dur(s) {
+  const d = Math.floor(s/86400), h = Math.floor(s%86400/3600), m = Math.floor(s%3600/60), x = s%60;
+  if (d) return `${d}d ${h}h`; if (h) return `${h}h ${m}m`; return `${m}m ${String(x).padStart(2,'0')}s`;
+}
+
+async function boot() {
+  META = await api('/api/meta');
+  ME = (await api('/api/me')).user;
+  render();
+}
+function render() {
+  clearInterval(timer);
+  $('#who').textContent = ME ? `${ME.name} · ${ME.role === 'agent' ? 'Support agent' : 'Employee'}` : '';
+  $('#logout').hidden = !ME;
+  if (!ME) return renderLogin();
+  ME.role === 'agent' ? renderAgent() : renderRequester();
+}
+$('#logout').onclick = async () => { await api('/api/logout', {method: 'POST', body: '{}'}); ME = null; closeDetail(); render(); };
+
+async function renderLogin() {
+  const users = await api('/api/users');
+  $('#app').innerHTML = `<div class="card" style="max-width:420px;margin:60px auto">
+    <h2>Sign in</h2><p class="mute">Demo sign-in: pick an identity. Replace with company SSO for production.</p>
+    <label for="u">User</label><select id="u">${users.map(u => `<option value="${u.id}">${esc(u.name)} (${u.role})</option>`).join('')}<option value="new">+ New User</option></select>
+    <div id="reg" hidden><label for="nm">Register your name</label><input id="nm" maxlength="60" placeholder="Full name" style="width:100%;padding:8px;border:1px solid var(--line);border-radius:6px">
+      <p class="mute" style="margin:6px 0 0">New users are registered as employees and can raise tickets.</p></div>
+    <p><button class="primary" id="go">Continue</button></p><div class="err" id="lerr"></div></div>`;
+  $('#u').onchange = () => { const n = $('#u').value === 'new'; $('#reg').hidden = !n; $('#go').textContent = n ? 'Register & continue' : 'Continue'; if (n) $('#nm').focus(); };
+  $('#nm').onkeydown = e => { if (e.key === 'Enter') $('#go').click(); };
+  $('#go').onclick = async () => {
+    $('#lerr').textContent = '';
+    try {
+      const isNew = $('#u').value === 'new';
+      const r = isNew ? await api('/api/register', {method: 'POST', body: JSON.stringify({name: $('#nm').value})})
+                      : await api('/api/login', {method: 'POST', body: JSON.stringify({user_id: +$('#u').value})});
+      ME = r.user; render();
+    } catch (e) { $('#lerr').textContent = e.message; }
+  };
+}
+
+function slaCell(t) { return `<span class="sla ${t.sla.state}" data-due="${t.sla_due_at}" data-active="${t.status==='Open'||t.status==='In Progress'}">${fmtRemaining(t.sla.remaining_seconds, t.sla.state)}</span>`; }
+const prio = t => `<span class="pill ${t.priority}">${t.priority} · ${esc(t.priority_label)}</span>`;
+
+function renderRequester() {
+  $('#app').innerHTML = `
+  <div class="card"><h2>Raise a ticket</h2>
+    <div class="row"><div><label for="cat">Category</label><select id="cat">${META.categories.map(c => `<option>${esc(c)}</option>`).join('')}</select></div>
+    <div><label for="pri">Priority</label><select id="pri">${META.priorities.map(p => `<option value="${p.code}" ${p.code==='P3'?'selected':''}>${p.code} – ${esc(p.label)} (target ${p.sla_hours>=24? p.sla_hours/24+' day'+(p.sla_hours>24?'s':'') : p.sla_hours+' hours'})</option>`).join('')}</select></div></div>
+    <label for="desc">Description</label><textarea id="desc" maxlength="5000" placeholder="What's happening? What have you tried?"></textarea>
+    <p><button class="primary" id="submit">Submit ticket</button></p><div class="err" id="err"></div></div>
+  <div class="card"><h2>My tickets</h2><div class="toolbar"><label style="margin:0;font-weight:400"><input type="checkbox" id="all"> Include resolved/closed</label></div><div id="list"></div></div>`;
+  $('#submit').onclick = async () => {
+    $('#err').textContent = '';
+    try {
+      const t = await api('/api/tickets', {method: 'POST', body: JSON.stringify({category: $('#cat').value, priority: $('#pri').value, description: $('#desc').value})});
+      $('#desc').value = ''; await load(); openDetail(t.id);
+    } catch (e) { $('#err').textContent = e.message; }
+  };
+  $('#all').onchange = load;
+  load();
+}
+
+function renderAgent() {
+  $('#app').innerHTML = `<div class="card"><h2>Support queue</h2>
+    <div class="legend"><span><i class="dot" style="background:#c0262d"></i>Breached</span><span><i class="dot" style="background:#e0a100"></i>At risk (≤25% of SLA left)</span><span><i class="dot" style="background:#cfe9da"></i>On track</span>
+    <span class="mute">Sorted by time remaining before breach</span></div>
+    <div class="toolbar"><label style="margin:0;font-weight:400"><input type="checkbox" id="all"> Include resolved/closed</label><span class="sp"></span><button id="exp">Export audit log (CSV)</button></div>
+    <div id="list"></div></div>`;
+  $('#exp').onclick = exportCsv;
+  $('#all').onchange = load;
+  load();
+}
+
+async function load() {
+  const view = $('#all')?.checked ? 'all' : 'active';
+  TICKETS = await api('/api/tickets?view=' + view);
+  drawList();
+}
+// one-time timers: 1s live countdown, 30s server refresh (re-sorts the queue)
+setInterval(() => ME && tick(), 1000);
+setInterval(() => { if (ME && $('#list')) load().catch(() => {}); }, 30000);
+function drawList() {
+  const agent = ME.role === 'agent';
+  if (!TICKETS.length) { $('#list').innerHTML = '<div class="empty">No tickets.</div>'; return; }
+  $('#list').innerHTML = `<table><thead><tr><th>#</th><th>Priority</th><th>Category</th><th>Description</th>${agent ? '<th>Requester</th>' : ''}<th>Assignee</th><th>Status</th><th>SLA</th></tr></thead><tbody>` +
+    TICKETS.map(t => `<tr class="s-${t.sla.state}" data-id="${t.id}"><td>${t.id}</td><td>${prio(t)}</td><td>${esc(t.category)}</td><td><div class="desc">${esc(t.description)}</div></td>${agent ? `<td>${esc(t.requester_name)}</td>` : ''}<td>${esc(t.assignee_name || '—')}</td><td>${esc(t.status)}</td><td>${slaCell(t)}</td></tr>`).join('') + '</tbody></table>';
+  document.querySelectorAll('#list tbody tr').forEach(tr => tr.onclick = () => openDetail(+tr.dataset.id));
+}
+function tick() { // live countdown without refetching
+  document.querySelectorAll('.sla[data-active="true"]').forEach(el => {
+    const tr = el.closest('tr'), t = tr && TICKETS.find(x => x.id == tr.dataset.id);
+    const rem = Math.round((new Date(el.dataset.due) - Date.now()) / 1000);
+    el.textContent = fmtRemaining(rem, 'live');
+    if (t && rem <= 0 && t.sla.state !== 'breached') { t.sla.state = 'breached'; drawList(); }
+  });
+}
+
+async function openDetail(id) {
+  const t = await api('/api/tickets/' + id);
+  const agent = ME.role === 'agent', next = META.transitions[t.status];
+  const d = $('#detail'); d.style.display = 'block';
+  d.innerHTML = `<div class="toolbar"><h2 style="margin:0">Ticket #${t.id}</h2><span class="sp"></span><button id="x">Close</button></div>
+    <p>${prio(t)} <span class="pill">${esc(t.status)}</span> <span class="pill">${esc(t.category)}</span></p>
+    <p>SLA: ${slaCell(t)} <span class="mute">· due ${fmtTime(t.sla_due_at)} (${t.sla_hours}h target)</span></p>
+    <p class="mute">Raised by ${esc(t.requester_name)} on ${fmtTime(t.created_at)}${t.assignee_name ? ' · Assigned to ' + esc(t.assignee_name) : ''}</p>
+    <div class="full">${esc(t.description)}</div>
+    ${agent && next.length ? `<label for="note">Note (optional, saved to audit log)</label><textarea id="note" style="min-height:50px" maxlength="500"></textarea>
+      <div class="actions">${next.map(s => `<button class="primary" data-s="${esc(s)}">${s === 'In Progress' && t.status === 'Resolved' ? 'Reopen → In Progress' : '→ ' + esc(s)}</button>`).join('')}</div><div class="err" id="derr"></div>` : ''}
+    <h2 style="margin-top:20px">Audit trail</h2>
+    <ul class="timeline">${t.events.map(e => `<li><b>${e.event_type === 'created' ? 'Created' : esc(e.from_status) + ' → ' + esc(e.to_status)}</b><br>
+      <span class="mute">${esc(e.actor_name)} (${esc(e.actor_role)}) · ${fmtTime(e.at)}</span>${e.note ? `<br>${esc(e.note)}` : ''}</li>`).join('')}</ul>`;
+  $('#x').onclick = closeDetail;
+  d.querySelectorAll('.actions button').forEach(b => b.onclick = async () => {
+    try { await api(`/api/tickets/${id}/status`, {method: 'POST', body: JSON.stringify({status: b.dataset.s, note: $('#note').value})}); await load(); openDetail(id); }
+    catch (e) { $('#derr').textContent = e.message; }
+  });
+}
+function closeDetail() { $('#detail').style.display = 'none'; }
+boot();
+</script>
+</body>
+</html>
